@@ -65,6 +65,9 @@ def _unified_calls_for_day_external(df_day: pd.DataFrame, debug: bool = False) -
     -------
     pandas.DataFrame
         Standardised call quotes with columns required by IV calibration.
+        The output columns are ``quote_date``, ``underlying_last``,
+        ``dte_days``, ``strike``, ``risk_free_1m``, ``div_yield_annual``,
+        ``is_call`` and ``mid_price``.
     """
 
     # Coerce numerics
@@ -160,8 +163,8 @@ def _unified_calls_for_day_external(df_day: pd.DataFrame, debug: bool = False) -
     out["quote_date"] = qdate
     out["underlying_last"] = S
     out["dte_days"] = dte_days
-    out["risk_free_rate"] = r
-    out["Annualized_Dividend_Yield"] = q
+    out["risk_free_1m"] = r
+    out["div_yield_annual"] = q
     out["is_call"] = True
 
     return out[
@@ -170,8 +173,8 @@ def _unified_calls_for_day_external(df_day: pd.DataFrame, debug: bool = False) -
             "underlying_last",
             "dte_days",
             "strike",
-            "risk_free_rate",
-            "Annualized_Dividend_Yield",
+            "risk_free_1m",
+            "div_yield_annual",
             "is_call",
             "mid_price",
         ]

@@ -17,7 +17,8 @@ def build_unified_calls_dataframe_external(
     Parameters
     ----------
     df_enriched:
-        Option data already merged with risk-free and dividend series.
+        Option data already merged with ``risk_free_1m`` and
+        ``div_yield_annual`` columns.
     verbose:
         Print summary information.
     debug_first_n:
@@ -26,7 +27,9 @@ def build_unified_calls_dataframe_external(
     Returns
     -------
     pandas.DataFrame
-        Cleaned call quotes ready for implied-volatility computation.
+        Cleaned call quotes ready for implied-volatility computation with
+        columns ``quote_date``, ``underlying_last``, ``dte_days``, ``strike``,
+        ``risk_free_1m``, ``div_yield_annual``, ``is_call`` and ``mid_price``.
     """
 
     df = df_enriched.copy()
@@ -53,8 +56,8 @@ def build_unified_calls_dataframe_external(
                 "underlying_last",
                 "dte_days",
                 "strike",
-                "risk_free_rate",
-                "Annualized_Dividend_Yield",
+                "risk_free_1m",
+                "div_yield_annual",
                 "is_call",
                 "mid_price",
             ]
