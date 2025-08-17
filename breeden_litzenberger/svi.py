@@ -1,4 +1,9 @@
-"""SVI calibration utilities."""
+"""SVI calibration utilities.
+
+This module relies on helper functions provided by :mod:`svi_helpers`,
+specifically :func:`fit_svi`, :func:`price_from_svi`, and
+:func:`convexity_report`.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import pandas as pd
 
 from .preprocessing import _unified_calls_for_day_external
 from .analysis import bl_density_from_prices
+from svi_helpers import fit_svi, price_from_svi, convexity_report
 
 
 def build_unified_calls_dataframe_external(
