@@ -1,10 +1,17 @@
+# sql.py
 import pymysql
+import pandas as pd
+import numpy as np
 
-### Methods
 
-# run SQL queries as read only user
-def SQL_dataframe(SQL_Query):
-    timeout = 10
+# -------------------------------
+# Core DB helper
+# -------------------------------
+def SQL_dataframe(SQL_Query: str, timeout: int = 30) -> pd.DataFrame:
+    """
+    Execute a read-only SQL query and return a pandas DataFrame.
+    Uses modest timeouts; chunk at the caller to avoid server timeouts.
+    """
     connection = pymysql.connect(
         charset="utf8mb4",
         connect_timeout=timeout,
@@ -21,111 +28,132 @@ def SQL_dataframe(SQL_Query):
         with connection.cursor() as cursor:
             cursor.execute(SQL_Query)
             result = cursor.fetchall()
-            df = pd.DataFrame(result)
-            return df
+            return pd.DataFrame(result)
     finally:
         connection.close()
 
 
-# actual query 
+# -------------------------------
+# Date range helpers (explicit, no work at import)
+# -------------------------------
+def get_min_max_dates(table_name: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    q = f"""
+        SELECT MIN(quote_date) AS min_date, MAX(quote_date) AS max_date
+        FROM {table_name};
+    """
+    df = SQL_dataframe(q)
+    if df.empty or pd.isna(df.loc[0, "min_date"]) or pd.isna(df.loc[0, "max_date"]):
+        return (pd.NaT, pd.NaT)
+    return (pd.to_datetime(df.loc[0, "min_date"]), pd.to_datetime(df.loc[0, "max_date"]))
 
-# ============================================================
-# Simple yearly snapshots + realized (+30 next trading day) all in pandas
-# - No extra SQL complexity (mirrors your working puts query style)
-# - Build the +30 mapping and realized underlying in pandas
-# ============================================================
-import pandas as pd
-import numpy as np
 
-# ---------- 1) Get min/max from each table (split queries to avoid timeout) ----------
-date_range_calls = SQL_dataframe("""
-    SELECT MIN(quote_date) AS min_date, MAX(quote_date) AS max_date
-    FROM calls_table;
-""")
-min_calls = date_range_calls['min_date'][0]
-max_calls = date_range_calls['max_date'][0]
+# -------------------------------
+# Snapshot fetchers (monthly, keyset pagination)
+# -------------------------------
+def _iter_month_windows(min_date, max_date):
+    """Yield (start_date, next_month_start) pairs as date objects."""
+    starts = pd.date_range(start=min_date, end=max_date, freq="MS")
+    for start in starts:
+        next_month = start + pd.DateOffset(months=1)
+        yield start.date(), next_month.date()
 
-date_range_puts = SQL_dataframe("""
-    SELECT MIN(quote_date) AS min_date, MAX(quote_date) AS max_date
-    FROM puts_table;
-""")
-min_puts = date_range_puts['min_date'][0]
-max_puts = date_range_puts['max_date'][0]
 
-print("calls_table range:", min_calls, "→", max_calls)
-print("puts_table  range:", min_puts,  "→", max_puts)
-
-# ---------- 2) Yearly batching (like your working query) ----------
-def fetch_snapshots_calls(min_date, max_date):
-    batch_starts = pd.date_range(start=min_date, end=max_date, freq='YS')
+def fetch_snapshots_calls(min_date, max_date, chunk_size: int = 100000, debug: bool = False) -> pd.DataFrame:
+    """
+    Fetch dte=30 snapshots from calls_table in monthly windows using keyset pagination.
+    Avoids BETWEEN; uses half-open [start, next_month) for better index use in MySQL.
+    Computes moneyness in Python to allow covering scans.
+    """
     results = []
-    for start in batch_starts:
-        end = (start + pd.DateOffset(years=1)) - pd.DateOffset(days=1)
-        q = f"""
-            SELECT 
-                id,
-                quote_date,
-                underlying_last,
-                dte,
-                strike,
-                strike / underlying_last AS moneyness,
-                c_bid,
-                c_ask,
-                c_last,
-                expire_date
-            FROM calls_table
-            WHERE dte = 30
-              AND c_bid IS NOT NULL
-              AND c_ask IS NOT NULL
-              AND c_iv  IS NOT NULL
-              AND underlying_last IS NOT NULL
-              AND underlying_last > 0
-              AND quote_date BETWEEN '{start.date()}' AND '{end.date()}'
-        """
-        df = SQL_dataframe(q)
-        results.append(df)
-    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    for start_date, next_month in _iter_month_windows(min_date, max_date):
+        last_id = 0
+        while True:
+            q = f"""
+                SELECT
+                    id,
+                    quote_date,
+                    underlying_last,
+                    dte,
+                    strike,
+                    c_bid,
+                    c_ask,
+                    c_last,
+                    expire_date
+                FROM calls_table
+                WHERE dte = 30
+                  AND quote_date >= '{start_date}'
+                  AND quote_date <  '{next_month}'
+                  AND id > {last_id}
+                ORDER BY id
+                LIMIT {chunk_size}
+            """
+            df = SQL_dataframe(q)
+            if df.empty:
+                break
+            results.append(df)
+            last_id = int(df["id"].max())
+            if debug:
+                print(f"[calls] {start_date}..{next_month}  +{len(df)} rows (last_id={last_id})", flush=True)
 
-def fetch_snapshots_puts(min_date, max_date):
-    batch_starts = pd.date_range(start=min_date, end=max_date, freq='YS')
+    if not results:
+        return pd.DataFrame()
+
+    out = pd.concat(results, ignore_index=True)
+    # Compute moneyness in Python (faster and index-friendly than in SELECT)
+    out["moneyness"] = out["strike"] / out["underlying_last"]
+    return out
+
+
+def fetch_snapshots_puts(min_date, max_date, chunk_size: int = 100000, debug: bool = False) -> pd.DataFrame:
+    """
+    Fetch dte=30 snapshots from puts_table in monthly windows using keyset pagination.
+    Fixes missing AND before quote_date; uses half-open window; computes moneyness in Python.
+    """
     results = []
-    for start in batch_starts:
-        end = (start + pd.DateOffset(years=1)) - pd.DateOffset(days=1)
-        q = f"""
-            SELECT 
-                id,
-                quote_date,
-                underlying_last,
-                dte,
-                strike,
-                strike / underlying_last AS moneyness,
-                p_bid,
-                p_ask,
-                p_last,
-                expire_date
-            FROM puts_table
-            WHERE dte = 30
-              AND p_bid IS NOT NULL
-              AND p_ask IS NOT NULL
-              AND p_iv  IS NOT NULL
-              AND underlying_last IS NOT NULL
-              AND underlying_last > 0
-              AND quote_date BETWEEN '{start.date()}' AND '{end.date()}'
-        """
-        df = SQL_dataframe(q)
-        results.append(df)
-    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    for start_date, next_month in _iter_month_windows(min_date, max_date):
+        last_id = 0
+        while True:
+            q = f"""
+                SELECT
+                    id,
+                    quote_date,
+                    underlying_last,
+                    dte,
+                    strike,
+                    p_bid,
+                    p_ask,
+                    p_last,
+                    expire_date
+                FROM puts_table
+                WHERE dte = 30
+                  AND quote_date >= '{start_date}'
+                  AND quote_date <  '{next_month}'
+                  AND id > {last_id}
+                ORDER BY id
+                LIMIT {chunk_size}
+            """
+            df = SQL_dataframe(q)
+            if df.empty:
+                break
+            results.append(df)
+            last_id = int(df["id"].max())
+            if debug:
+                print(f"[puts]  {start_date}..{next_month}  +{len(df)} rows (last_id={last_id})", flush=True)
 
-df_snapshots_calls = fetch_snapshots_calls(min_calls, max_calls)
-df_snapshots_puts  = fetch_snapshots_puts(min_puts,  max_puts)
+    if not results:
+        return pd.DataFrame()
 
-print("Calls snapshots:", df_snapshots_calls.shape)
-print("Unique call quote_dates:", df_snapshots_calls["quote_date"].nunique() if not df_snapshots_calls.empty else 0)
-print("Puts snapshots:", df_snapshots_puts.shape)
-print("Unique put quote_dates:", df_snapshots_puts["quote_date"].nunique() if not df_snapshots_puts.empty else 0)
+    out = pd.concat(results, ignore_index=True)
+    out["moneyness"] = out["strike"] / out["underlying_last"]
+    return out
 
-# ---------- 3) Build +30 next-trading-day mapping in pandas ----------
-def attach_realized_from_self(df_snapshots, quote_col="quote_date", ul_col="underlying_last"):
+
+# -------------------------------
+# Realized (+30d next trading day) helper
+# -------------------------------
+def attach_realized_from_self(df_snapshots: pd.DataFrame,
+                              quote_col: str = "quote_date",
+                              ul_col: str = "underlying_last") -> pd.DataFrame:
     """
     For a snapshot DataFrame from a single table:
     - Build calendar of available trading days from `quote_col`
@@ -133,22 +161,24 @@ def attach_realized_from_self(df_snapshots, quote_col="quote_date", ul_col="unde
     - Join realized_underlying from per-day underlying_last (groupby max)
     Returns df with added columns: realized_date, realized_underlying
     """
-    if df_snapshots.empty:
-        df_snapshots[["realized_date", "realized_underlying"]] = np.nan
-        return df_snapshots
+    if df_snapshots is None or df_snapshots.empty:
+        df = df_snapshots.copy() if df_snapshots is not None else pd.DataFrame()
+        df[["realized_date", "realized_underlying"]] = np.nan
+        return df
 
-    # Ensure datetime
     df = df_snapshots.copy()
     df[quote_col] = pd.to_datetime(df[quote_col])
 
     # Unique trading calendar from the snapshot
-    cal = (df[[quote_col]]
-           .drop_duplicates()
-           .sort_values(quote_col)
-           .rename(columns={quote_col: "cal_date"})
-           .reset_index(drop=True))
+    cal = (
+        df[[quote_col]]
+        .drop_duplicates()
+        .sort_values(quote_col)
+        .rename(columns={quote_col: "cal_date"})
+        .reset_index(drop=True)
+    )
 
-    # Target = quote_date + 30 calendar days
+    # Targets = quote_date + 30 calendar days
     key = df[[quote_col]].drop_duplicates().sort_values(quote_col).reset_index(drop=True)
     key["target"] = key[quote_col] + pd.Timedelta(days=30)
 
@@ -159,14 +189,15 @@ def attach_realized_from_self(df_snapshots, quote_col="quote_date", ul_col="unde
         left_on="target",
         right_on="cal_date",
         direction="forward",
-        allow_exact_matches=True
+        allow_exact_matches=True,
     ).rename(columns={"cal_date": "realized_date"})[[quote_col, "realized_date"]]
 
     # Per-day underlying_last (max is safe if constant intraday)
-    ul_by_day = (df.groupby(quote_col, as_index=False)[ul_col]
-                   .max()
-                   .rename(columns={quote_col: "realized_date",
-                                    ul_col: "realized_underlying"}))
+    ul_by_day = (
+        df.groupby(quote_col, as_index=False)[ul_col]
+        .max()
+        .rename(columns={quote_col: "realized_date", ul_col: "realized_underlying"})
+    )
 
     # Merge realized_date into snapshots, then realized_underlying
     df = df.merge(mapped, on=quote_col, how="left")
@@ -174,25 +205,21 @@ def attach_realized_from_self(df_snapshots, quote_col="quote_date", ul_col="unde
 
     return df
 
-df_snapshots_calls = attach_realized_from_self(df_snapshots_calls,
-                                              quote_col="quote_date",
-                                              ul_col="underlying_last")
 
-df_snapshots_puts  = attach_realized_from_self(df_snapshots_puts,
-                                              quote_col="quote_date",
-                                              ul_col="underlying_last")
+# -------------------------------
+# Optional: quick self-test entrypoint (won't run on import)
+# -------------------------------
+if __name__ == "__main__":
+    # Example: peek at date ranges without heavy fetching
+    min_calls, max_calls = get_min_max_dates("calls_table")
+    min_puts,  max_puts  = get_min_max_dates("puts_table")
+    print("calls_table range:", min_calls, "→", max_calls)
+    print("puts_table  range:", min_puts,  "→", max_puts)
 
-# ---------- 4) Final checks ----------
-print("Calls (with realized):", df_snapshots_calls.shape,
-      "| missing realized:", df_snapshots_calls["realized_underlying"].isna().sum())
-
-print("Puts  (with realized):", df_snapshots_puts.shape,
-      "| missing realized:", df_snapshots_puts["realized_underlying"].isna().sum())
-
-# Optionally drop rows without a realized trading day found
-df_snapshots_calls = df_snapshots_calls.dropna(subset=["realized_date","realized_underlying"])
-df_snapshots_puts  = df_snapshots_puts.dropna(subset=["realized_date","realized_underlying"])
-
-print("Calls (after dropna):", df_snapshots_calls.shape)
-print("Puts  (after dropna):", df_snapshots_puts.shape)
-# 
+    # Small smoke test on one month if ranges exist
+    if pd.notna(min_calls):
+        sample_calls = fetch_snapshots_calls(min_calls, min_calls, chunk_size=20000, debug=True)
+        print("sample calls:", sample_calls.shape)
+    if pd.notna(min_puts):
+        sample_puts = fetch_snapshots_puts(min_puts, min_puts, chunk_size=20000, debug=True)
+        print("sample puts:", sample_puts.shape)
