@@ -14,6 +14,7 @@ if str(_THIS_DIR) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pymysql
 
 import sql
 
@@ -38,6 +39,78 @@ except ImportError:
     )
     from svi import build_unified_calls_dataframe_external, run_svi_over_all_days
     from analysis import compute_bl_pdfs_for_all_days, prepare_pit_df
+
+
+def fetch_option_data(
+    min_calls: pd.Timestamp,
+    max_calls: pd.Timestamp,
+    min_puts: pd.Timestamp,
+    max_puts: pd.Timestamp,
+    chunk_size: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Retrieve option snapshots for calls and puts and attach realized prices.
+
+    Parameters
+    ----------
+    min_calls, max_calls, min_puts, max_puts:
+        Date ranges for calls and puts tables.
+    chunk_size:
+        Number of rows to request per SQL query. Smaller sizes help avoid
+        database timeouts on slow connections.
+
+    Returns
+    -------
+    option_df:
+        Combined DataFrame with call and put snapshots.
+    realized_map:
+        Series mapping quote_date to realized underlying prices.
+    """
+
+    try:
+        calls = sql.fetch_snapshots_calls(min_calls, max_calls, chunk_size=chunk_size)
+    except pymysql.MySQLError as exc:  # pragma: no cover - network operation
+        print(f"Failed to fetch call snapshots: {exc}", flush=True)
+        calls = pd.DataFrame()
+
+    try:
+        puts = sql.fetch_snapshots_puts(min_puts, max_puts, chunk_size=chunk_size)
+    except pymysql.MySQLError as exc:  # pragma: no cover - network operation
+        print(f"Failed to fetch put snapshots: {exc}", flush=True)
+        puts = pd.DataFrame()
+
+    if calls.empty or puts.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    calls = calls.rename(
+        columns={
+            "c_bid": "bid",
+            "c_ask": "ask",
+            "c_last": "last",
+            "c_iv": "implied_volatility",
+        }
+    )
+    calls["is_call"] = True
+
+    puts = puts.rename(
+        columns={
+            "p_bid": "bid",
+            "p_ask": "ask",
+            "p_last": "last",
+            "p_iv": "implied_volatility",
+        }
+    )
+    puts["is_call"] = False
+
+    option_df = pd.concat([calls, puts], ignore_index=True)
+
+    realized_map = (
+        sql.attach_realized_from_self(calls)[["quote_date", "realized_underlying"]]
+        .dropna()
+        .drop_duplicates("quote_date")
+        .set_index("quote_date")["realized_underlying"]
+    )
+
+    return option_df, realized_map
 
 
 def plot_pit_diagram(pit_values: pd.Series) -> None:
@@ -78,49 +151,15 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1) Fetch option snapshots from SQL and combine calls/puts
     # ------------------------------------------------------------------
-    calls = sql.fetch_snapshots_calls(min_calls, max_calls)
+    chunk_size = int(os.getenv("SQL_CHUNK_SIZE", "50000"))
+    option_df, realized_map = fetch_option_data(
+        min_calls, max_calls, min_puts, max_puts, chunk_size
+    )
     print("checkpoint 1", flush=True)
 
-    puts = sql.fetch_snapshots_puts(min_puts, max_puts)
-    print("checkpoint 2", flush=True)
-
-    if calls.empty:
-        print("No call snapshots fetched. Aborting.", flush=True)
+    if option_df.empty:
+        print("No option snapshots fetched. Aborting.", flush=True)
         return
-    if puts.empty:
-        print("No put snapshots fetched. Aborting.", flush=True)
-        return
-
-    # Normalize columns; computing IV in SQL was removed, renames are safe.
-    calls = calls.rename(
-        columns={
-            "c_bid": "bid",
-            "c_ask": "ask",
-            "c_last": "last",
-            "c_iv": "implied_volatility",
-        }
-    )
-    calls["is_call"] = True
-
-    puts = puts.rename(
-        columns={
-            "p_bid": "bid",
-            "p_ask": "ask",
-            "p_last": "last",
-            "p_iv": "implied_volatility",
-        }
-    )
-    puts["is_call"] = False
-
-    option_df = pd.concat([calls, puts], ignore_index=True)
-
-    # Attach realized prices from call snapshots (one per day)
-    realized_map = (
-        sql.attach_realized_from_self(calls)[["quote_date", "realized_underlying"]]
-        .dropna()
-        .drop_duplicates("quote_date")
-        .set_index("quote_date")["realized_underlying"]
-    )
 
     # ------------------------------------------------------------------
     # 2) Merge risk-free rates and dividend yields
@@ -128,7 +167,7 @@ def main() -> None:
     rf = load_risk_free_rates("DGS1MO.csv")
     div = load_dividend_yield("enriched_dividend_yield_2010_2023.csv")
     enriched = merge_rates_and_dividends(option_df, rf, div)
-    print("checkpoint 3", flush=True)
+    print("checkpoint 2", flush=True)
 
     if enriched.empty:
         print("Enriched dataframe is empty after merging rates/dividends. Aborting.", flush=True)
@@ -144,7 +183,7 @@ def main() -> None:
         return
 
     summary_df, artifacts = run_svi_over_all_days(unified_calls, verbose=False)
-    print("checkpoint 4", flush=True)
+    print("checkpoint 3", flush=True)
 
     if summary_df.empty:
         print("SVI summary is empty. Aborting.", flush=True)
