@@ -27,6 +27,7 @@ try:
     )
     from svi import build_unified_calls_dataframe_external, run_svi_over_all_days
     from analysis import compute_bl_pdfs_for_all_days, prepare_pit_df
+    from svi_helpers import iv_from_price
 except ImportError:
     # If you're running this from a different working dir, ensure project root is on sys.path
     project_root = _THIS_DIR
@@ -39,6 +40,7 @@ except ImportError:
     )
     from svi import build_unified_calls_dataframe_external, run_svi_over_all_days
     from analysis import compute_bl_pdfs_for_all_days, prepare_pit_df
+    from svi_helpers import iv_from_price
 
 
 def fetch_option_data(
@@ -181,6 +183,19 @@ def main() -> None:
     if unified_calls.empty:
         print("Unified calls dataframe is empty. Aborting.", flush=True)
         return
+
+    unified_calls = unified_calls.rename(columns={"dte_days": "dte"})
+    unified_calls["implied_volatility"] = unified_calls.apply(
+        lambda row: iv_from_price(
+            row["underlying_last"],
+            row["strike"],
+            row["dte"] / 365.0,
+            row["risk_free_1m"],
+            row["div_yield_annual"],
+            row["mid_price"],
+        ),
+        axis=1,
+    )
 
     summary_df, artifacts = run_svi_over_all_days(unified_calls, verbose=False)
     print("checkpoint 3", flush=True)
