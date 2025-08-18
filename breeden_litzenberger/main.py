@@ -1,7 +1,13 @@
-"""Executable pipeline from SQL data sourcing to PIT diagram."""
+"""Executable pipeline from SQL data sourcing to PIT diagram.
+
+This module can source option data either directly from the SQL database or
+from a pre-built CSV file. The latter is useful in environments where direct
+database access is unavailable.
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -135,28 +141,59 @@ def plot_pit_diagram(pit_values: pd.Series) -> None:
     plt.show()
 
 
-def main() -> None:
-    """Run the full Breeden–Litzenberger pipeline and plot PIT diagram."""
-    # ------------------------------------------------------------------
-    # 0) Resolve date ranges from DB (no heavy work at import)
-    # ------------------------------------------------------------------
-    min_calls, max_calls = sql.get_min_max_dates("calls_table")
-    min_puts, max_puts = sql.get_min_max_dates("puts_table")
+def main(argv: list[str] | None = None) -> None:
+    """Run the full Breeden–Litzenberger pipeline and plot PIT diagram.
 
-    if pd.isna(min_calls) or pd.isna(max_calls):
-        print("calls_table has no data (min/max are NaT). Aborting.", flush=True)
-        return
-    if pd.isna(min_puts) or pd.isna(max_puts):
-        print("puts_table has no data (min/max are NaT). Aborting.", flush=True)
-        return
+    Parameters
+    ----------
+    argv:
+        Optional list of command-line arguments. If ``--options-csv`` is
+        provided, option snapshots are loaded from the given CSV instead of
+        querying the SQL database.
+    """
 
-    # ------------------------------------------------------------------
-    # 1) Fetch option snapshots from SQL and combine calls/puts
-    # ------------------------------------------------------------------
-    chunk_size = int(os.getenv("SQL_CHUNK_SIZE", "50000"))
-    option_df, realized_map = fetch_option_data(
-        min_calls, max_calls, min_puts, max_puts, chunk_size
+    parser = argparse.ArgumentParser(description="Breeden–Litzenberger pipeline")
+    parser.add_argument(
+        "--options-csv",
+        type=str,
+        default=None,
+        help="Path to CSV containing option snapshots to bypass SQL queries",
     )
+    args = parser.parse_args(argv)
+
+    if args.options_csv:
+        # ------------------------------------------------------------------
+        # 0) Load option snapshots from CSV
+        # ------------------------------------------------------------------
+        option_df = pd.read_csv(args.options_csv, parse_dates=["quote_date"])
+        realized_map = (
+            option_df[["quote_date", "realized_underlying"]]
+            .dropna()
+            .drop_duplicates("quote_date")
+            .set_index("quote_date")["realized_underlying"]
+        )
+    else:
+        # ------------------------------------------------------------------
+        # 0) Resolve date ranges from DB (no heavy work at import)
+        # ------------------------------------------------------------------
+        min_calls, max_calls = sql.get_min_max_dates("calls_table")
+        min_puts, max_puts = sql.get_min_max_dates("puts_table")
+
+        if pd.isna(min_calls) or pd.isna(max_calls):
+            print("calls_table has no data (min/max are NaT). Aborting.", flush=True)
+            return
+        if pd.isna(min_puts) or pd.isna(max_puts):
+            print("puts_table has no data (min/max are NaT). Aborting.", flush=True)
+            return
+
+        # ------------------------------------------------------------------
+        # 1) Fetch option snapshots from SQL and combine calls/puts
+        # ------------------------------------------------------------------
+        chunk_size = int(os.getenv("SQL_CHUNK_SIZE", "50000"))
+        option_df, realized_map = fetch_option_data(
+            min_calls, max_calls, min_puts, max_puts, chunk_size
+        )
+
     print("checkpoint 1", flush=True)
 
     if option_df.empty:
