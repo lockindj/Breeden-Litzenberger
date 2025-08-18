@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from math import log, exp, sqrt, isfinite
-from scipy.optimize import least_squares
+from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "convexity_report",
     "svi_w",
     "lee_wing_slopes_ok",
+    "iv_from_price",
 ]
 
 
@@ -65,6 +66,37 @@ bs_price = _bs_price_fallback
 
 # Vectorized call pricer for convenience
 bs_call_vec = np.vectorize(lambda S, K, T, r, q, sig: bs_price(S, K, T, r, q, sig, True))
+
+
+def iv_from_price(S, K, T, r, q, price, is_call: bool = True) -> float:
+    """Infer implied volatility from a Black-Scholes price.
+
+    Parameters
+    ----------
+    S, K : float
+        Spot and strike.
+    T : float
+        Time to expiry in years.
+    r, q : float
+        Risk-free and dividend yields.
+    price : float
+        Observed option price.
+    is_call : bool, default True
+        Price is for a call if ``True`` otherwise a put.
+
+    Returns
+    -------
+    float
+        Implied volatility or ``nan`` if no solution is found.
+    """
+
+    def objective(sig):
+        return bs_price(S, K, T, r, q, sig, is_call) - price
+
+    try:
+        return brentq(objective, 1e-6, 5.0, maxiter=100, xtol=1e-8)
+    except ValueError:
+        return float("nan")
 
 
 # ---------------------------------------------------------------------------
