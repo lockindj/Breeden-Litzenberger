@@ -27,7 +27,7 @@ try:
     )
     from svi import build_unified_calls_dataframe_external, run_svi_over_all_days
     from analysis import compute_bl_pdfs_for_all_days, prepare_pit_df
-    from svi_helpers import iv_from_price
+    from myutils.implied_vola.adapters.pandas_python import compute_iv_on_dataframe
 except ImportError:
     # If you're running this from a different working dir, ensure project root is on sys.path
     project_root = _THIS_DIR
@@ -40,7 +40,7 @@ except ImportError:
     )
     from svi import build_unified_calls_dataframe_external, run_svi_over_all_days
     from analysis import compute_bl_pdfs_for_all_days, prepare_pit_df
-    from svi_helpers import iv_from_price
+    from myutils.implied_vola.adapters.pandas_python import compute_iv_on_dataframe
 
 
 def fetch_option_data(
@@ -185,16 +185,20 @@ def main() -> None:
         return
 
     unified_calls = unified_calls.rename(columns={"dte_days": "dte"})
-    unified_calls["implied_volatility"] = unified_calls.apply(
-        lambda row: iv_from_price(
-            row["underlying_last"],
-            row["strike"],
-            row["dte"] / 365.0,
-            row["risk_free_1m"],
-            row["div_yield_annual"],
-            row["mid_price"],
-        ),
-        axis=1,
+    unified_calls["is_call"] = True
+    unified_calls = compute_iv_on_dataframe(
+        unified_calls,
+        column_map={
+            "S": "underlying_last",
+            "K": "strike",
+            "DTE": "dte",
+            "r": "risk_free_1m",
+            "q": "div_yield_annual",
+            "price": "mid_price",
+            "is_call": "is_call",
+        },
+        dte_unit="days",
+        out_iv_col="implied_volatility",
     )
 
     summary_df, artifacts = run_svi_over_all_days(unified_calls, verbose=False)
